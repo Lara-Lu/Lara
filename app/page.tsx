@@ -1,25 +1,19 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
-import { onAuthStateChanged } from "firebase/auth";
-import { auth, db } from "@/lib/firebase";
-import {
-  addDoc,
-  collection,
-  doc,
-  getDoc,
-  setDoc,
-  serverTimestamp,
-} from "firebase/firestore";
 
-type Msg = { role: "user" | "assistant"; content: string };
+import { useEffect, useRef, useState, FormEvent } from "react";
+import { auth } from "@/lib/firebase";
+import { onAuthStateChanged, signOut, type User } from "firebase/auth";
+
+type Msg = { id: number; role: "user" | "assistant"; content: string };
 
 export default function Home() {
-  const [user, setUser] = useState<any>(null);
-  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [user, setUser] = useState<User | null>(null);
+  const [msgs, setMsgs] = useState<Msg[]>([
+    { id: 1, role: "assistant", content: "Hey! I’m Lara. What should we tackle first?" },
+  ]);
   const [input, setInput] = useState("");
-  const [summary, setSummary] = useState("");
   const [sending, setSending] = useState(false);
-  const scroller = useRef<HTMLDivElement>(null);
+  const endRef = useRef<HTMLDivElement>(null);
 
   // Register service worker once
   useEffect(() => {
@@ -29,77 +23,50 @@ export default function Home() {
   }, []);
 
   // auth state
-  useEffect(() => onAuthStateChanged(auth, (u) => setUser(u)), []);
-
-  // autoscroll on new messages
   useEffect(() => {
-    scroller.current?.scrollTo({
-      top: scroller.current.scrollHeight,
-      behavior: "smooth",
-    });
+    const unsub = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsub();
+  }, []);
+
+  // autoscroll
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [msgs]);
 
-  // ensure profile + load summary
-  async function ensureProfile() {
-    const ref = doc(db, "users", user.uid);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) {
-      await setDoc(ref, { createdAt: serverTimestamp(), summary: "" });
-    } else {
-      setSummary(snap.data()?.summary ?? "");
-    }
-  }
-  useEffect(() => {
-    if (user) ensureProfile();
-  }, [user]);
-
-  async function send() {
+  async function send(e?: FormEvent) {
+    if (e) e.preventDefault();
     const text = input.trim();
     if (!text || sending) return;
-    setSending(true);
-    const newMsgs = [...msgs, { role: "user", content: text } as Msg];
-    setMsgs(newMsgs);
+
+    const nextId = msgs.length ? Math.max(...msgs.map((m) => m.id)) + 1 : 1;
+    const outgoing: Msg = { id: nextId, role: "user", content: text };
+    setMsgs((prev) => [...prev, outgoing]);
     setInput("");
+    setSending(true);
 
     try {
       const res = await fetch("/api/lara", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: newMsgs, summary }),
-      });
-      const { reply } = await res.json();
-      const next = [...newMsgs, { role: "assistant", content: reply } as Msg];
-      setMsgs(next);
-
-      // persist last exchange
-      await addDoc(collection(db, "users", user.uid, "messages"), {
-        msgs: next.slice(-2),
-        ts: serverTimestamp(),
+        // Keep server payload minimal; no summary to avoid extra hooks
+        body: JSON.stringify({
+          messages: [
+            { role: "system", content: "You are Lara, a concise, low-cost productivity companion." },
+            ...msgs.map(({ role, content }) => ({ role, content })),
+            { role: "user", content: text },
+          ],
+        }),
       });
 
-      // cheap running summary every 6 turns
-      if (next.length % 6 === 0) {
-        const sres = await fetch("/api/lara", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Summarize the conversation so far in <=10 bullets focused on user preferences and tasks.",
-              },
-              {
-                role: "user",
-                content: next.map((m) => `${m.role}: ${m.content}`).join("\n"),
-              },
-            ],
-          }),
-        });
-        const { reply: sum } = await sres.json();
-        setSummary(sum);
-        await setDoc(doc(db, "users", user.uid), { summary: sum }, { merge: true });
-      }
+      const data: { reply?: string } = await res.json();
+      const reply = data.reply ?? "Hmm, I didn’t get a reply. Try again?";
+      const incoming: Msg = { id: nextId + 1, role: "assistant", content: reply };
+      setMsgs((prev) => [...prev, incoming]);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? `Error: ${err.message}` : "Unknown error occurred.";
+      const incoming: Msg = { id: nextId + 1, role: "assistant", content: msg };
+      setMsgs((prev) => [...prev, incoming]);
     } finally {
       setSending(false);
     }
@@ -119,7 +86,7 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-neutral-950 text-white">
+    <main className="flex min-h-screen flex-col bg-neutral-950 text-white">
       {/* Header */}
       <header className="sticky top-0 z-10 border-b border-neutral-800 bg-neutral-950/80 backdrop-blur">
         <div className="mx-auto max-w-3xl px-4 py-3 flex items-center justify-between">
@@ -129,40 +96,37 @@ export default function Home() {
               Peace of mind for less than your morning coffee.
             </p>
           </div>
-          <div className="text-xs text-emerald-400">Summary tokens saved ✅</div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-emerald-400">Install-ready PWA ✅</span>
+            <button
+              onClick={() => signOut(auth)}
+              className="text-xs border border-white/40 rounded px-2 py-1 hover:bg-white/10"
+              title="Sign out"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Chat card */}
-      <section className="mx-auto max-w-3xl px-4 py-6">
+      {/* Chat area */}
+      <section className="mx-auto max-w-3xl px-4 py-6 w-full">
         <div className="rounded-2xl bg-white/5 ring-1 ring-white/10 shadow-xl">
-          {/* Messages */}
-          <div
-            ref={scroller}
-            className="h-[60vh] overflow-y-auto p-4 space-y-3 bg-white rounded-t-2xl"
-          >
-            {msgs.length === 0 && (
-              <div className="text-neutral-500 text-sm">Say hello to start.</div>
-            )}
-
-            {msgs.map((m, i) => (
+          <div className="h-[60vh] overflow-y-auto p-4 space-y-3 bg-white rounded-t-2xl">
+            {msgs.map((m) => (
               <div
-                key={i}
+                key={m.id}
                 className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
                   className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm leading-relaxed ${
-                    m.role === "user"
-                      ? "bg-blue-200 text-black"
-                      : "bg-neutral-300 text-black"
+                    m.role === "user" ? "bg-blue-200 text-black" : "bg-neutral-300 text-black"
                   }`}
                 >
                   {m.content}
                 </div>
               </div>
             ))}
-
-            {/* FIXED: no broken className */}
             {sending && (
               <div className="flex justify-start">
                 <div className="max-w-[80%] rounded-2xl px-3 py-2 text-sm bg-neutral-300 text-black">
@@ -170,28 +134,28 @@ export default function Home() {
                 </div>
               </div>
             )}
+            <div ref={endRef} />
           </div>
 
           {/* Composer */}
-          <div className="p-3 border-t border-white/20 bg-neutral-900 rounded-b-2xl">
+          <form onSubmit={send} className="p-3 border-t border-white/20 bg-neutral-900 rounded-b-2xl">
             <div className="flex gap-2">
               <input
                 className="flex-1 rounded-xl bg-white text-black placeholder-neutral-500 px-3 py-2 outline-none"
                 placeholder="Tell Lara what to do…"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && send()}
                 disabled={sending}
               />
               <button
-                onClick={send}
+                type="submit"
                 disabled={sending}
                 className="rounded-xl px-4 py-2 bg-white text-black font-medium hover:bg-neutral-100 active:scale-[0.99] disabled:opacity-60"
               >
                 {sending ? "Sending…" : "Send"}
               </button>
             </div>
-          </div>
+          </form>
         </div>
       </section>
     </main>
