@@ -1,163 +1,222 @@
 "use client";
 
 import { useEffect, useRef, useState, FormEvent } from "react";
-import { auth } from "@/lib/firebase";
-import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 
-type Msg = { id: number; role: "user" | "assistant"; content: string };
+// Firebase
+import { auth, db } from "@/lib/firebase";
+import { onAuthStateChanged } from "firebase/auth";
+import {
+  addDoc,
+  collection,
+  getDocs,
+  orderBy,
+  query,
+  serverTimestamp,
+} from "firebase/firestore";
 
-export default function Home() {
-  const [user, setUser] = useState<User | null>(null);
-  const [msgs, setMsgs] = useState<Msg[]>([
-    { id: 1, role: "assistant", content: "Hey! I’m Lara. What should we tackle first?" },
+// ---- Types ----
+type ChatRole = "system" | "user" | "assistant";
+
+type ChatMsg = {
+  role: ChatRole;
+  content: string;
+  createdAt?: unknown; // Firestore timestamp (we don't need to manipulate it client-side)
+  uid?: string;
+};
+
+// ---- UI Component ----
+export default function Page() {
+  const [msgs, setMsgs] = useState<ChatMsg[]>([
+    {
+      role: "system",
+      content:
+        "You are Lara, a concise, low-cost productivity companion.",
+    },
   ]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const [uid, setUid] = useState<string | null>(null);
 
-  // Register service worker once
-  useEffect(() => {
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
-    }
-  }, []);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
 
-  // auth state
+  // Scroll to last message when msgs change
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => setUser(u));
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [msgs]);
+
+  // Track auth state → know which user's history to load/save
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
     return () => unsub();
   }, []);
 
-  // autoscroll
+  // Load chat history for this user (if any)
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [msgs]);
+    async function loadHistory() {
+      if (!uid) {
+        // no user → keep default system prompt only
+        setLoadingHistory(false);
+        return;
+      }
+      setLoadingHistory(true);
+      try {
+        const col = collection(db, "users", uid, "messages");
+        const q = query(col, orderBy("createdAt", "asc"));
+        const snap = await getDocs(q);
+        const items: ChatMsg[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as ChatMsg;
+          if (data?.role && data?.content) {
+            items.push({ role: data.role, content: data.content, createdAt: data.createdAt });
+          }
+        });
+
+        if (items.length) {
+          setMsgs(items);
+        } else {
+          // seed with system prompt if brand new
+          setMsgs([
+            {
+              role: "system",
+              content:
+                "You are Lara, a concise, low-cost productivity companion.",
+            },
+          ]);
+        }
+      } finally {
+        setLoadingHistory(false);
+      }
+    }
+
+    void loadHistory();
+  }, [uid]);
+
+  // Persist a single message
+  async function saveMessage(m: ChatMsg) {
+    if (!uid) return; // only persist for signed-in users
+    const col = collection(db, "users", uid, "messages");
+    await addDoc(col, { ...m, createdAt: serverTimestamp(), uid });
+  }
 
   async function send(e?: FormEvent) {
-    if (e) e.preventDefault();
+    e?.preventDefault();
     const text = input.trim();
     if (!text || sending) return;
 
-    const nextId = msgs.length ? Math.max(...msgs.map((m) => m.id)) + 1 : 1;
-    const outgoing: Msg = { id: nextId, role: "user", content: text };
-    setMsgs((prev) => [...prev, outgoing]);
+    // optimistic user message
     setInput("");
-    setSending(true);
+    const userMsg: ChatMsg = { role: "user", content: text };
+    setMsgs((prev) => [...prev, userMsg]);
+    void saveMessage(userMsg);
 
+    setSending(true);
     try {
+      // Keep context lightweight (system + last ~20 turns)
+      const context = trimContext([...msgs, userMsg], 20);
+
       const res = await fetch("/api/lara", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Keep server payload minimal; no summary to avoid extra hooks
-        body: JSON.stringify({
-          messages: [
-            { role: "system", content: "You are Lara, a concise, low-cost productivity companion." },
-            ...msgs.map(({ role, content }) => ({ role, content })),
-            { role: "user", content: text },
-          ],
-        }),
+        body: JSON.stringify({ messages: context }),
       });
 
-      const data: { reply?: string } = await res.json();
-      const reply = data.reply ?? "Hmm, I didn’t get a reply. Try again?";
-      const incoming: Msg = { id: nextId + 1, role: "assistant", content: reply };
-      setMsgs((prev) => [...prev, incoming]);
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? `Error: ${err.message}` : "Unknown error occurred.";
-      const incoming: Msg = { id: nextId + 1, role: "assistant", content: msg };
-      setMsgs((prev) => [...prev, incoming]);
+      const raw = await res.text();
+      let data: { reply?: string } = {};
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = { reply: raw || "Server returned empty response." };
+      }
+
+      const reply =
+        (data.reply ?? "").trim() ||
+        "Hmm, I didn’t get a reply. Try again in a moment.";
+
+      const botMsg: ChatMsg = { role: "assistant", content: reply };
+      setMsgs((prev) => [...prev, botMsg]);
+      void saveMessage(botMsg);
+    } catch (err) {
+      const botMsg: ChatMsg = {
+        role: "assistant",
+        content:
+          err instanceof Error
+            ? `Error: ${err.message}`
+            : "Error: Something went wrong.",
+      };
+      setMsgs((prev) => [...prev, botMsg]);
+      void saveMessage(botMsg);
     } finally {
       setSending(false);
     }
   }
 
-  if (!user) {
-    return (
-      <main className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6">
-        <div className="text-center space-y-2">
-          <h1 className="text-3xl font-bold">Lara</h1>
-          <p className="text-neutral-400">
-            Please <a className="underline" href="/login">log in</a> to continue.
-          </p>
-        </div>
-      </main>
-    );
-  }
-
   return (
-    <main className="flex min-h-screen flex-col bg-neutral-950 text-white">
-      {/* Header */}
-      <header className="sticky top-0 z-10 border-b border-neutral-800 bg-neutral-950/80 backdrop-blur">
-        <div className="mx-auto max-w-3xl px-4 py-3 flex items-center justify-between">
-          <div className="space-y-0.5">
-            <h1 className="text-xl font-semibold">Lara</h1>
-            <p className="text-xs text-neutral-400">
-              Peace of mind for less than your morning coffee.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-emerald-400">Install-ready PWA ✅</span>
-            <button
-              onClick={() => signOut(auth)}
-              className="text-xs border border-white/40 rounded px-2 py-1 hover:bg-white/10"
-              title="Sign out"
-            >
-              Sign out
-            </button>
-          </div>
+    <main className="min-h-[100dvh] w-full flex flex-col items-center py-6">
+      <div className="w-full max-w-4xl rounded-2xl bg-zinc-900/40 border border-zinc-800 shadow-xl p-4 sm:p-6 flex flex-col gap-4">
+        <div className="text-sm text-zinc-400">
+          {loadingHistory
+            ? "Loading your history…"
+            : "Hey! I’m Lara. What should we tackle first?"}
         </div>
-      </header>
 
-      {/* Chat area */}
-      <section className="mx-auto max-w-3xl px-4 py-6 w-full">
-        <div className="rounded-2xl bg-white/5 ring-1 ring-white/10 shadow-xl">
-          <div className="h-[60vh] overflow-y-auto p-4 space-y-3 bg-white rounded-t-2xl">
-            {msgs.map((m) => (
-              <div
-                key={m.id}
-                className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-              >
+        {/* Messages */}
+        <div className="flex-1 min-h-[50vh] max-h-[65vh] overflow-y-auto rounded-xl bg-zinc-950/60 p-4 space-y-3">
+          {msgs
+            // never show raw system prompt bubble
+            .filter((m) => m.role !== "system")
+            .map((m, i) => {
+              const me = m.role === "user";
+              return (
                 <div
-                  className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm leading-relaxed ${
-                    m.role === "user" ? "bg-blue-200 text-black" : "bg-neutral-300 text-black"
-                  }`}
+                  key={i}
+                  className={`w-full flex ${me ? "justify-end" : "justify-start"}`}
                 >
-                  {m.content}
+                  <div
+                    className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-6 ${
+                      me
+                        ? "bg-blue-500/25 border border-blue-400/30 text-blue-50"
+                        : "bg-zinc-800/70 border border-zinc-700 text-zinc-100"
+                    }`}
+                  >
+                    {m.content}
+                  </div>
                 </div>
-              </div>
-            ))}
-            {sending && (
-              <div className="flex justify-start">
-                <div className="max-w-[80%] rounded-2xl px-3 py-2 text-sm bg-neutral-300 text-black">
-                  <span className="animate-pulse">Lara is typing…</span>
-                </div>
-              </div>
-            )}
-            <div ref={endRef} />
-          </div>
-
-          {/* Composer */}
-          <form onSubmit={send} className="p-3 border-t border-white/20 bg-neutral-900 rounded-b-2xl">
-            <div className="flex gap-2">
-              <input
-                className="flex-1 rounded-xl bg-white text-black placeholder-neutral-500 px-3 py-2 outline-none"
-                placeholder="Tell Lara what to do…"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                disabled={sending}
-              />
-              <button
-                type="submit"
-                disabled={sending}
-                className="rounded-xl px-4 py-2 bg-white text-black font-medium hover:bg-neutral-100 active:scale-[0.99] disabled:opacity-60"
-              >
-                {sending ? "Sending…" : "Send"}
-              </button>
-            </div>
-          </form>
+              );
+            })}
+          <div ref={bottomRef} />
         </div>
-      </section>
+
+        {/* Composer */}
+        <form
+          onSubmit={send}
+          className="flex items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-950 p-2"
+        >
+          <input
+            className="flex-1 bg-transparent outline-none px-3 py-2 text-zinc-100 placeholder:text-zinc-500"
+            placeholder="Tell Lara what to do…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={sending}
+          />
+          <button
+            type="submit"
+            disabled={sending || !input.trim()}
+            className="rounded-xl bg-white/95 text-black px-4 py-2 text-sm font-medium hover:bg-white disabled:opacity-50"
+          >
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </form>
+      </div>
     </main>
   );
+}
+
+// Keep system prompt + last N exchanges to control token use
+function trimContext(all: ChatMsg[], maxTurns: number): ChatMsg[] {
+  const sys = all.find((m) => m.role === "system");
+  const rest = all.filter((m) => m.role !== "system");
+  // each "turn" is user+assistant pair; simple slice on last 2*maxTurns messages
+  const kept = rest.slice(-2 * maxTurns);
+  return sys ? [sys, ...kept] : kept;
 }
