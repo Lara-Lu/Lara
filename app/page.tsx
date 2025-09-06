@@ -1,222 +1,327 @@
 "use client";
 
-import { useEffect, useRef, useState, FormEvent } from "react";
-
-// Firebase
+import React, { useEffect, useRef, useState } from "react";
 import { auth, db } from "@/lib/firebase";
-import { onAuthStateChanged } from "firebase/auth";
 import {
-  addDoc,
-  collection,
-  getDocs,
-  orderBy,
-  query,
+  onAuthStateChanged,
+  signOut,
+  GoogleAuthProvider,
+  signInWithPopup,
+  User,
+} from "firebase/auth";
+import {
+  doc,
+  getDoc,
+  setDoc,
   serverTimestamp,
+  updateDoc,
 } from "firebase/firestore";
 
-// ---- Types ----
-type ChatRole = "system" | "user" | "assistant";
-
-type ChatMsg = {
+type ChatRole = "user" | "assistant" | "system";
+type ChatMessage = {
   role: ChatRole;
   content: string;
-  createdAt?: unknown; // Firestore timestamp (we don't need to manipulate it client-side)
-  uid?: string;
+  ts?: number;
 };
 
-// ---- UI Component ----
+const THREAD_ID = "default";
+
 export default function Page() {
-  const [msgs, setMsgs] = useState<ChatMsg[]>([
-    {
-      role: "system",
-      content:
-        "You are Lara, a concise, low-cost productivity companion.",
-    },
-  ]);
+  // Auth & profile
+  const [user, setUser] = useState<User | null>(null);
+
+  // Chat state
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [loadingHistory, setLoadingHistory] = useState(true);
-  const [uid, setUid] = useState<string | null>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Google Calendar access token (client-side)
+  const [gToken, setGToken] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
-  // Scroll to last message when msgs change
+  // ---------------------------
+  // Auth wiring
+  // ---------------------------
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [msgs]);
-
-  // Track auth state → know which user's history to load/save
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      if (u) {
+        await loadUserHistory(u.uid);
+      } else {
+        setMessages([]);
+      }
+    });
     return () => unsub();
   }, []);
 
-  // Load chat history for this user (if any)
-  useEffect(() => {
-    async function loadHistory() {
-      if (!uid) {
-        // no user → keep default system prompt only
-        setLoadingHistory(false);
-        return;
-      }
-      setLoadingHistory(true);
-      try {
-        const col = collection(db, "users", uid, "messages");
-        const q = query(col, orderBy("createdAt", "asc"));
-        const snap = await getDocs(q);
-        const items: ChatMsg[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as ChatMsg;
-          if (data?.role && data?.content) {
-            items.push({ role: data.role, content: data.content, createdAt: data.createdAt });
-          }
+  // ---------------------------
+  // Load & save chat history
+  // ---------------------------
+  async function loadUserHistory(uid: string) {
+    setLoadingHistory(true);
+    try {
+      const ref = doc(db, "users", uid, "threads", THREAD_ID);
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        const data = snap.data();
+        const msgs = (data.messages ?? []) as ChatMessage[];
+        setMessages(msgs);
+      } else {
+        // Create a starter doc
+        await setDoc(ref, {
+          messages: [],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
         });
-
-        if (items.length) {
-          setMsgs(items);
-        } else {
-          // seed with system prompt if brand new
-          setMsgs([
-            {
-              role: "system",
-              content:
-                "You are Lara, a concise, low-cost productivity companion.",
-            },
-          ]);
-        }
-      } finally {
-        setLoadingHistory(false);
+        setMessages([]);
       }
+    } catch (e) {
+      console.error("loadUserHistory error:", e);
+    } finally {
+      setLoadingHistory(false);
     }
-
-    void loadHistory();
-  }, [uid]);
-
-  // Persist a single message
-  async function saveMessage(m: ChatMsg) {
-    if (!uid) return; // only persist for signed-in users
-    const col = collection(db, "users", uid, "messages");
-    await addDoc(col, { ...m, createdAt: serverTimestamp(), uid });
   }
 
-  async function send(e?: FormEvent) {
-    e?.preventDefault();
+  async function saveUserHistory(uid: string, msgs: ChatMessage[]) {
+    try {
+      const ref = doc(db, "users", uid, "threads", THREAD_ID);
+      await updateDoc(ref, {
+        messages: msgs,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (e) {
+      // If updateDoc fails because doc doesn't exist, setDoc instead
+      const ref = doc(db, "users", uid, "threads", THREAD_ID);
+      await setDoc(
+        ref,
+        {
+          messages: msgs,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  }
+
+  // ---------------------------
+  // Chat sending
+  // ---------------------------
+  async function sendMessage() {
     const text = input.trim();
     if (!text || sending) return;
+    const newUserMsg: ChatMessage = {
+      role: "user",
+      content: text,
+      ts: Date.now(),
+    };
 
-    // optimistic user message
+    const newMsgs = [...messages, newUserMsg];
+    setMessages(newMsgs);
     setInput("");
-    const userMsg: ChatMsg = { role: "user", content: text };
-    setMsgs((prev) => [...prev, userMsg]);
-    void saveMessage(userMsg);
+    scrollToBottom();
+
+    if (user) {
+      // Save user draft immediately
+      saveUserHistory(user.uid, newMsgs).catch(console.error);
+    }
 
     setSending(true);
     try {
-      // Keep context lightweight (system + last ~20 turns)
-      const context = trimContext([...msgs, userMsg], 20);
-
       const res = await fetch("/api/lara", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: context }),
+        // Only send what we need
+        body: JSON.stringify({
+          messages: newMsgs.map((m) => ({ role: m.role, content: m.content })),
+        }),
       });
 
-      const raw = await res.text();
-      let data: { reply?: string } = {};
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        data = { reply: raw || "Server returned empty response." };
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error("API error:", errText);
+        const failMsg: ChatMessage = {
+          role: "assistant",
+          content: "Sorry—something went wrong reaching my brain.",
+          ts: Date.now(),
+        };
+        const withFail = [...newMsgs, failMsg];
+        setMessages(withFail);
+        if (user) saveUserHistory(user.uid, withFail).catch(console.error);
+        return;
       }
 
-      const reply =
-        (data.reply ?? "").trim() ||
-        "Hmm, I didn’t get a reply. Try again in a moment.";
-
-      const botMsg: ChatMsg = { role: "assistant", content: reply };
-      setMsgs((prev) => [...prev, botMsg]);
-      void saveMessage(botMsg);
-    } catch (err) {
-      const botMsg: ChatMsg = {
+      const data = await res.json();
+      const assistantText: string =
+        data?.assistant ?? data?.text ?? "Okay! (No content returned.)";
+      const botMsg: ChatMessage = {
         role: "assistant",
-        content:
-          err instanceof Error
-            ? `Error: ${err.message}`
-            : "Error: Something went wrong.",
+        content: assistantText,
+        ts: Date.now(),
       };
-      setMsgs((prev) => [...prev, botMsg]);
-      void saveMessage(botMsg);
+      const next = [...newMsgs, botMsg];
+      setMessages(next);
+      if (user) saveUserHistory(user.uid, next).catch(console.error);
+    } catch (e) {
+      console.error(e);
+      const failMsg: ChatMessage = {
+        role: "assistant",
+        content: "Network hiccup—try again?",
+        ts: Date.now(),
+      };
+      const withFail = [...newMsgs, failMsg];
+      setMessages(withFail);
+      if (user) saveUserHistory(user.uid, withFail).catch(console.error);
     } finally {
       setSending(false);
+      scrollToBottom();
     }
   }
 
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function scrollToBottom() {
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  }
+
+  // ---------------------------
+  // Google Calendar connect
+  // ---------------------------
+  async function connectGoogle() {
+    if (!user) return;
+    try {
+      const provider = new GoogleAuthProvider();
+      // Ask specifically for Calendar scope
+      provider.addScope("https://www.googleapis.com/auth/calendar");
+      const result = await signInWithPopup(auth, provider);
+      const cred = GoogleAuthProvider.credentialFromResult(result);
+      // cred?.accessToken is Google's token (not Firebase custom token)
+      // It may be null in some flows; in that case you'd exchange server-side.
+      const tok = (cred as any)?.accessToken ?? null;
+      setGToken(tok);
+      console.log("Google Calendar connected. accessToken:", tok);
+    } catch (e) {
+      console.error("connectGoogle error:", e);
+      alert("Google authorization failed. Check console for details.");
+    }
+  }
+
+  async function doSignOut() {
+    try {
+      await signOut(auth);
+      setGToken(null);
+      setMessages([]);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // ---------------------------
+  // Render
+  // ---------------------------
   return (
-    <main className="min-h-[100dvh] w-full flex flex-col items-center py-6">
-      <div className="w-full max-w-4xl rounded-2xl bg-zinc-900/40 border border-zinc-800 shadow-xl p-4 sm:p-6 flex flex-col gap-4">
-        <div className="text-sm text-zinc-400">
-          {loadingHistory
-            ? "Loading your history…"
-            : "Hey! I’m Lara. What should we tackle first?"}
+    <div className="min-h-dvh w-full bg-black text-white flex items-start justify-center p-4">
+      <div className="w-full max-w-3xl rounded-2xl bg-zinc-900 border border-white/10 shadow-xl overflow-hidden">
+        {/* Header */}
+        <div className="px-4 py-3 border-b border-white/10">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-zinc-400">
+              {loadingHistory
+                ? "Loading your history…"
+                : "Hey! I’m Lara. What should we tackle first?"}
+            </div>
+
+            <div className="flex items-center gap-2">
+              {/* Build tag to verify latest deploy */}
+              <span className="text-[10px] text-zinc-500 border border-zinc-700 px-2 py-0.5 rounded-md">
+                build: {process.env.NEXT_PUBLIC_BUILD ?? "dev"}
+              </span>
+
+              {/* Auth controls */}
+              {!user ? (
+                <a
+                  href="/login"
+                  className="rounded-lg border border-white/20 px-3 py-1.5 text-xs hover:bg-white/10"
+                >
+                  Sign in
+                </a>
+              ) : (
+                <button
+                  onClick={doSignOut}
+                  className="rounded-lg border border-white/20 px-3 py-1.5 text-xs hover:bg-white/10"
+                >
+                  Sign out
+                </button>
+              )}
+
+              {/* Calendar connect (always visible; disabled until signed-in) */}
+              <button
+                onClick={connectGoogle}
+                disabled={!user}
+                className="rounded-lg border border-white/20 px-3 py-1.5 text-xs hover:bg-white/10 disabled:opacity-50"
+                title={
+                  !user
+                    ? "Sign in first to connect Google"
+                    : "Connect your Google Calendar"
+                }
+              >
+                {!user
+                  ? "Log in to connect"
+                  : gToken
+                  ? "Google Connected ✅"
+                  : "Connect Google Calendar"}
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Messages */}
-        <div className="flex-1 min-h-[50vh] max-h-[65vh] overflow-y-auto rounded-xl bg-zinc-950/60 p-4 space-y-3">
-          {msgs
-            // never show raw system prompt bubble
-            .filter((m) => m.role !== "system")
-            .map((m, i) => {
-              const me = m.role === "user";
-              return (
-                <div
-                  key={i}
-                  className={`w-full flex ${me ? "justify-end" : "justify-start"}`}
-                >
-                  <div
-                    className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm leading-6 ${
-                      me
-                        ? "bg-blue-500/25 border border-blue-400/30 text-blue-50"
-                        : "bg-zinc-800/70 border border-zinc-700 text-zinc-100"
-                    }`}
-                  >
-                    {m.content}
-                  </div>
-                </div>
-              );
-            })}
+        <div className="h-[60vh] overflow-y-auto px-4 py-3 space-y-3">
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              className={`max-w-[85%] rounded-2xl px-3 py-2 text-sm ${
+                m.role === "user"
+                  ? "ml-auto bg-blue-900/50 border border-blue-600/30"
+                  : "mr-auto bg-zinc-800/60 border border-white/10"
+              }`}
+            >
+              {m.content}
+            </div>
+          ))}
           <div ref={bottomRef} />
         </div>
 
         {/* Composer */}
-        <form
-          onSubmit={send}
-          className="flex items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-950 p-2"
-        >
-          <input
-            className="flex-1 bg-transparent outline-none px-3 py-2 text-zinc-100 placeholder:text-zinc-500"
-            placeholder="Tell Lara what to do…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            disabled={sending}
-          />
-          <button
-            type="submit"
-            disabled={sending || !input.trim()}
-            className="rounded-xl bg-white/95 text-black px-4 py-2 text-sm font-medium hover:bg-white disabled:opacity-50"
-          >
-            {sending ? "Sending…" : "Send"}
-          </button>
-        </form>
+        <div className="border-t border-white/10 p-3">
+          <div className="flex gap-2">
+            <input
+              className="flex-1 rounded-xl bg-zinc-800 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/20"
+              placeholder="Tell Lara what to do…"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={onKeyDown}
+              disabled={sending}
+            />
+            <button
+              onClick={sendMessage}
+              disabled={sending || !input.trim()}
+              className="rounded-xl bg-white/10 border border-white/20 px-4 text-sm hover:bg-white/20 disabled:opacity-50"
+            >
+              {sending ? "Sending…" : "Send"}
+            </button>
+          </div>
+        </div>
       </div>
-    </main>
+    </div>
   );
-}
-
-// Keep system prompt + last N exchanges to control token use
-function trimContext(all: ChatMsg[], maxTurns: number): ChatMsg[] {
-  const sys = all.find((m) => m.role === "system");
-  const rest = all.filter((m) => m.role !== "system");
-  // each "turn" is user+assistant pair; simple slice on last 2*maxTurns messages
-  const kept = rest.slice(-2 * maxTurns);
-  return sys ? [sys, ...kept] : kept;
 }
