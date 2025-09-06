@@ -8,6 +8,7 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   User,
+  OAuthCredential,
 } from "firebase/auth";
 import {
   doc,
@@ -24,6 +25,11 @@ type ChatMessage = {
   ts?: number;
 };
 
+type ApiResponse = {
+  assistant?: string;
+  text?: string;
+};
+
 const THREAD_ID = "default";
 
 export default function Page() {
@@ -36,7 +42,7 @@ export default function Page() {
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
-  // Google Calendar access token (client-side)
+  // Google Calendar access token (client-side only)
   const [gToken, setGToken] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -65,11 +71,10 @@ export default function Page() {
       const ref = doc(db, "users", uid, "threads", THREAD_ID);
       const snap = await getDoc(ref);
       if (snap.exists()) {
-        const data = snap.data();
-        const msgs = (data.messages ?? []) as ChatMessage[];
+        const data = snap.data() as { messages?: ChatMessage[] };
+        const msgs = data.messages ?? [];
         setMessages(msgs);
       } else {
-        // Create a starter doc
         await setDoc(ref, {
           messages: [],
           createdAt: serverTimestamp(),
@@ -77,8 +82,6 @@ export default function Page() {
         });
         setMessages([]);
       }
-    } catch (e) {
-      console.error("loadUserHistory error:", e);
     } finally {
       setLoadingHistory(false);
     }
@@ -91,7 +94,7 @@ export default function Page() {
         messages: msgs,
         updatedAt: serverTimestamp(),
       });
-    } catch (e) {
+    } catch {
       // If updateDoc fails because doc doesn't exist, setDoc instead
       const ref = doc(db, "users", uid, "threads", THREAD_ID);
       await setDoc(
@@ -124,7 +127,6 @@ export default function Page() {
     scrollToBottom();
 
     if (user) {
-      // Save user draft immediately
       saveUserHistory(user.uid, newMsgs).catch(console.error);
     }
 
@@ -133,15 +135,12 @@ export default function Page() {
       const res = await fetch("/api/lara", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Only send what we need
         body: JSON.stringify({
           messages: newMsgs.map((m) => ({ role: m.role, content: m.content })),
         }),
       });
 
       if (!res.ok) {
-        const errText = await res.text();
-        console.error("API error:", errText);
         const failMsg: ChatMessage = {
           role: "assistant",
           content: "Sorry—something went wrong reaching my brain.",
@@ -153,9 +152,10 @@ export default function Page() {
         return;
       }
 
-      const data = await res.json();
+      const data = (await res.json()) as ApiResponse;
       const assistantText: string =
-        data?.assistant ?? data?.text ?? "Okay! (No content returned.)";
+        data.assistant ?? data.text ?? "Okay! (No content returned.)";
+
       const botMsg: ChatMessage = {
         role: "assistant",
         content: assistantText,
@@ -164,8 +164,7 @@ export default function Page() {
       const next = [...newMsgs, botMsg];
       setMessages(next);
       if (user) saveUserHistory(user.uid, next).catch(console.error);
-    } catch (e) {
-      console.error(e);
+    } catch {
       const failMsg: ChatMessage = {
         role: "assistant",
         content: "Network hiccup—try again?",
@@ -200,17 +199,16 @@ export default function Page() {
     if (!user) return;
     try {
       const provider = new GoogleAuthProvider();
-      // Ask specifically for Calendar scope
       provider.addScope("https://www.googleapis.com/auth/calendar");
+
       const result = await signInWithPopup(auth, provider);
-      const cred = GoogleAuthProvider.credentialFromResult(result);
-      // cred?.accessToken is Google's token (not Firebase custom token)
-      // It may be null in some flows; in that case you'd exchange server-side.
-      const tok = (cred as any)?.accessToken ?? null;
+      const cred = GoogleAuthProvider.credentialFromResult(result) as OAuthCredential | null;
+      const tok = cred?.accessToken ?? null;
+
       setGToken(tok);
       console.log("Google Calendar connected. accessToken:", tok);
-    } catch (e) {
-      console.error("connectGoogle error:", e);
+    } catch (err) {
+      console.error("connectGoogle error:", err);
       alert("Google authorization failed. Check console for details.");
     }
   }
@@ -220,8 +218,8 @@ export default function Page() {
       await signOut(auth);
       setGToken(null);
       setMessages([]);
-    } catch (e) {
-      console.error(e);
+    } catch (err) {
+      console.error(err);
     }
   }
 
@@ -263,7 +261,7 @@ export default function Page() {
                 </button>
               )}
 
-              {/* Calendar connect (always visible; disabled until signed-in) */}
+              {/* Calendar connect (visible; disabled until signed-in) */}
               <button
                 onClick={connectGoogle}
                 disabled={!user}
