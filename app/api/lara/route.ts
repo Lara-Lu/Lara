@@ -1,14 +1,54 @@
 // app/api/lara/route.ts
 import { NextResponse } from "next/server";
 
+/** Message format we send to OpenAI */
+type ChatRole = "system" | "user" | "assistant";
+interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+
+/** Minimal shape of OpenAI response we care about */
+interface OpenAIChatResponse {
+  choices?: Array<{
+    message?: { content?: string };
+  }>;
+}
+
+/** Narrow an unknown value to ChatMessage[] if possible */
+function isChatMessages(value: unknown): value is ChatMessage[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (m) =>
+        m &&
+        typeof m === "object" &&
+        "role" in m &&
+        "content" in m &&
+        (m as Record<string, unknown>).role !== undefined &&
+        (m as Record<string, unknown>).content !== undefined
+    )
+  );
+}
+
 export async function POST(req: Request) {
   try {
-    let payload: any = {};
+    // Parse inbound JSON defensively (no 'any')
+    let parsed: unknown = null;
     try {
-      payload = await req.json();
+      parsed = await req.json();
     } catch {
-      // no body
+      // ignore; we'll handle below
     }
+
+    // Accept either {message: string} or {messages: ChatMessage[]}
+    const maybeObj = (parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : {}) as Record<string, unknown>;
+
+    const single =
+      typeof maybeObj.message === "string" ? maybeObj.message : null;
+    const history = isChatMessages(maybeObj.messages) ? maybeObj.messages : [];
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -18,15 +58,15 @@ export async function POST(req: Request) {
       );
     }
 
-    // Accept either a single message or an array of messages
-    const single = typeof payload?.message === "string" ? payload.message : null;
-    const history = Array.isArray(payload?.messages) ? payload.messages : [];
-
-    const messages =
+    const messages: ChatMessage[] =
       history.length > 0
         ? history
         : [
-            { role: "system", content: "You are Lara, a concise, low-cost productivity companion." },
+            {
+              role: "system",
+              content:
+                "You are Lara, a concise, low-cost productivity companion.",
+            },
             { role: "user", content: single ?? "Say hi briefly." },
           ];
 
@@ -46,17 +86,16 @@ export async function POST(req: Request) {
     const raw = await r.text();
 
     if (!r.ok) {
-      // Return upstream error as readable text
       return NextResponse.json(
         { reply: `OpenAI error ${r.status}: ${raw || "no body"}` },
         { status: 200 }
       );
     }
 
-    // Be tolerant to upstream non-JSON (rare, but defensive)
-    let data: any;
+    // Parse upstream JSON defensively
+    let data: OpenAIChatResponse | null = null;
     try {
-      data = JSON.parse(raw);
+      data = JSON.parse(raw) as OpenAIChatResponse;
     } catch {
       return NextResponse.json(
         { reply: `Upstream returned non-JSON: ${raw || "empty body"}` },
